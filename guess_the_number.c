@@ -5,115 +5,157 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <stdbool.h>
+#include <errno.h>
+#include <string.h>
 
-#define MAX_GUESSES 100
+#define FIFO_NAME1 "/tmp/guess_number_fifo1"
+#define FIFO_NAME2 "/tmp/guess_number_fifo2"
+#define MAX_ATTEMPTS 100
+#define GAME_CYCLES 10
+#define BUFFER_SIZE 128
 
-volatile sig_atomic_t guessed_number = 0;
-volatile sig_atomic_t current_guess = 0;
-volatile sig_atomic_t attempts = 0;
 volatile sig_atomic_t game_over = 0;
-volatile sig_atomic_t is_guesser = 0;
-volatile sig_atomic_t ready = 0;
 
-void handle_signal(int sig, siginfo_t *info, void *context) {
-    if (sig == SIGUSR1) {
-        game_over = 1;
-        printf("Guessed correctly! Number was %d. Attempts: %d\n", current_guess, attempts);
-    } else if (sig == SIGUSR2) {
-        printf("Guess %d is wrong.\n", current_guess);
-    } else if (sig >= SIGRTMIN && sig <= SIGRTMAX) {
-        current_guess = sig - SIGRTMIN + 1;
-        attempts++;
-    }
+void sigint_handler(int sig) {
+    (void)sig;
+    game_over = 1;
 }
 
-void setup_signal_handlers() {
-    struct sigaction sa;
-    sa.sa_flags = SA_SIGINFO;
-    sa.sa_sigaction = handle_signal;
-    sigemptyset(&sa.sa_mask);
-
-    sigaction(SIGUSR1, &sa, NULL);
-    sigaction(SIGUSR2, &sa, NULL);
-
-    for (int i = SIGRTMIN; i <= SIGRTMAX; i++) {
-        sigaction(i, &sa, NULL);
-    }
-}
-
-void play_guesser(int max_number, pid_t other_pid) {
-    srand(time(NULL) ^ (getpid() << 16));
-    while (!game_over) {
-        int guess = rand() % max_number + 1;
-        printf("Guessing %d...\n", guess);
-        kill(other_pid, SIGRTMIN + guess - 1);
-        pause(); // Wait for response (SIGUSR1 or SIGUSR2)
-    }
-}
-
-void play_thinker(int max_number, pid_t other_pid) {
-    srand(time(NULL) ^ (getpid() << 16));
-    guessed_number = rand() % max_number + 1;
-    printf("Thinker: I'm thinking of %d (pid=%d)\n", guessed_number, getpid());
-    kill(other_pid, SIGUSR1); // Notify guesser to start
-    while (!game_over) {
-        pause(); // Wait for guess (SIGRTMIN + guess)
-        if (current_guess == guessed_number) {
-            kill(other_pid, SIGUSR1); // Correct
-        } else {
-            kill(other_pid, SIGUSR2); // Wrong
-        }
-    }
+void cleanup() {
+    unlink(FIFO_NAME1);
+    unlink(FIFO_NAME2);
 }
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s <max_number>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <N>\n", argv[0]);
         return 1;
     }
-    int max_number = atoi(argv[1]);
-    if (max_number <= 0) {
-        fprintf(stderr, "Max number must be positive\n");
+    
+    int N = atoi(argv[1]);
+    if (N <= 0) {
+        fprintf(stderr, "N must be positive\n");
         return 1;
     }
-
-    setup_signal_handlers();
-
+    
+    signal(SIGINT, sigint_handler);
+    atexit(cleanup);
+    
+    //creating named channels
+    mkfifo(FIFO_NAME1, 0666);
+    mkfifo(FIFO_NAME2, 0666);
+    
     pid_t pid = fork();
     if (pid == -1) {
         perror("fork");
         return 1;
     }
+    
+    srand(time(NULL) ^ (getpid() << 16));
+    
+    int fd_read, fd_write;
+    if (pid == 0) {
+        //child process(start with guesser)
+        fd_read = open(FIFO_NAME1, O_RDONLY);
+        fd_write = open(FIFO_NAME2, O_WRONLY);
+        printf("Child process started as guesser (pid: %d)\n", getpid());
+    } else {
+        //parent process
+        fd_write = open(FIFO_NAME1, O_WRONLY);
+        fd_read = open(FIFO_NAME2, O_RDONLY);
+        printf("Parent process started as thinker (pid: %d)\n", getpid());
+    }
+    
+    int cycles = 0;
+    int is_guesser = (pid == 0); // 1 - guessr, 0 - thinker
 
-    for (int round = 0; round < 10; round++) {
-        game_over = 0;
-        attempts = 0;
-        current_guess = 0;
-        if (pid == 0) {
-            // Child process
-            if (round % 2 == 0) {
-                is_guesser = 1;
-                play_guesser(max_number, getppid());
-            } else {
-                is_guesser = 0;
-                play_thinker(max_number, getppid());
+    while (cycles < GAME_CYCLES && !game_over) {
+        if (!is_guesser) {
+            //mod thinker
+            int number = rand() % N + 1;
+            printf("Thinker (pid %d): I'm thinking of %d\n", getpid(), number);
+            
+            //send number for guesser
+            char buffer[BUFFER_SIZE];
+            snprintf(buffer, BUFFER_SIZE, "THINK %d", number);
+            write(fd_write, buffer, strlen(buffer)+1);
+            
+            //accept and check
+            int attempts = 0;
+            char response[BUFFER_SIZE];
+            while (!game_over) {
+                read(fd_read, response, BUFFER_SIZE);
+                
+                if (strncmp(response, "GUESS", 5) == 0) {
+                    int guess;
+                    sscanf(response, "GUESS %d", &guess);
+                    attempts++;
+                    
+                    if (guess == number) {
+                        printf("Thinker: Correct guess %d in %d attempts!\n", guess, attempts);
+                        snprintf(buffer, BUFFER_SIZE, "RESULT CORRECT %d", attempts);
+                        write(fd_write, buffer, strlen(buffer)+1);
+                        break;
+                    } else {
+                        printf("Thinker: Wrong guess %d (attempt %d)\n", guess, attempts);
+                        snprintf(buffer, BUFFER_SIZE, "RESULT WRONG");
+                        write(fd_write, buffer, strlen(buffer)+1);
+                    }
+                }
             }
+            is_guesser = 1; //change rols
         } else {
-            // Parent process
-            if (round % 2 == 0) {
-                is_guesser = 0;
-                play_thinker(max_number, pid);
-            } else {
-                is_guesser = 1;
-                play_guesser(max_number, pid);
+            char message[BUFFER_SIZE];
+            read(fd_read, message, BUFFER_SIZE);
+            
+            if (strncmp(message, "THINK", 5) == 0) {
+                int number;
+                sscanf(message, "THINK %d", &number);
+                int attempts = 0;
+                
+                while (!game_over) {
+                    attempts++;
+                    int guess = rand() % N + 1;
+                    printf("Guesser (pid %d): Attempt %d - guessing %d\n", 
+                          getpid(), attempts, guess);
+                    
+                    //send guess
+                    char buffer[BUFFER_SIZE];
+                    snprintf(buffer, BUFFER_SIZE, "GUESS %d", guess);
+                    write(fd_write, buffer, strlen(buffer)+1);
+                    
+                    //get a response
+                    read(fd_read, message, BUFFER_SIZE);
+                    if (strncmp(message, "RESULT CORRECT", 14) == 0) {
+                        int used_attempts;
+                        sscanf(message, "RESULT CORRECT %d", &used_attempts);
+                        printf("Guesser: Correct! Number was %d (attempts: %d)\n",
+                              number, used_attempts);
+                        break;
+                    } else if (strncmp(message, "RESULT WRONG", 12) == 0) {
+                        continue;
+                    }
+                }
+                is_guesser = 0; //change rols
             }
         }
+        //retry for win
+        cycles++;
+        printf("--- Completed round %d ---\n", cycles);
     }
-
+    
+    //End
+    close(fd_read);
+    close(fd_write);
+    
     if (pid != 0) {
-        kill(pid, SIGTERM); // Terminate child
-        wait(NULL);
+        int status;
+        waitpid(pid, &status, 0);
+        printf("Game finished after %d rounds\n", cycles);
     }
+    
     return 0;
 }
