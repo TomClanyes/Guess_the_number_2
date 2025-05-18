@@ -1,161 +1,136 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <signal.h>
-#include <time.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
 #include <fcntl.h>
-#include <stdbool.h>
-#include <errno.h>
+#include <sys/stat.h>
 #include <string.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/wait.h>
 
-#define FIFO_NAME1 "/tmp/guess_number_fifo1"
-#define FIFO_NAME2 "/tmp/guess_number_fifo2"
-#define MAX_ATTEMPTS 100
-#define GAME_CYCLES 10
-#define BUFFER_SIZE 128
+#define FIFO_REQ "guess_fifo"
+#define FIFO_RES "result_fifo"
+#define ROUNDS 10
+#define MAX_N 100
 
-volatile sig_atomic_t game_over = 0;
-
-void sigint_handler(int sig) {
-    (void)sig;
-    game_over = 1;
+// Очистка FIFO при выходе
+void cleanup() {
+    unlink(FIFO_REQ);
+    unlink(FIFO_RES);
 }
 
-void cleanup() {
-    unlink(FIFO_NAME1);
-    unlink(FIFO_NAME2);
+// Алгоритм Фишера-Йетса — перемешивание массива
+void shuffle(int *array, int n) {
+    for (int i = n - 1; i > 0; --i) {
+        int j = rand() % (i + 1);
+        int temp = array[i];
+        array[i] = array[j];
+        array[j] = temp;
+    }
+}
+
+// Родитель загадывает, читает попытки из FIFO и отвечает
+void parent_round(int N, int fd_req, int fd_res) {
+    int number = rand() % N + 1;
+    int guess = 0;
+    int attempts = 0;
+
+    printf("\n[Родитель] Загадал число от 1 до %d\n", N);
+
+    while (1) {
+        read(fd_req, &guess, sizeof(int));
+        attempts++;
+
+        if (guess == number) {
+            int response = 1;
+            write(fd_res, &response, sizeof(int));
+            printf("[Родитель] Угадано! Попыток: %d\n", attempts);
+            break;
+        } else {
+            int response = 0;
+            write(fd_res, &response, sizeof(int));
+        }
+    }
+}
+
+// Дочерний процесс угадывает случайными уникальными числами
+void child_round(int N, int fd_req, int fd_res) {
+    int *numbers = malloc(sizeof(int) * N);
+    for (int i = 0; i < N; i++) {
+        numbers[i] = i + 1;
+    }
+
+    shuffle(numbers, N);
+
+    int response = 0;
+    int attempts = 0;
+
+    for (int i = 0; i < N; i++) {
+        int guess = numbers[i];
+        printf("[Дочерний] Пробую: %d\n", guess);
+        write(fd_req, &guess, sizeof(int));
+        read(fd_res, &response, sizeof(int));
+        attempts++;
+
+        if (response == 1) {
+            printf("[Дочерний] Угадал число %d за %d попыток!\n", guess, attempts);
+            break;
+        }
+    }
+
+    free(numbers);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <N>\n", argv[0]);
-        return 1;
-    }
-    
-    int N = atoi(argv[1]);
-    if (N <= 0) {
-        fprintf(stderr, "N must be positive\n");
-        return 1;
-    }
-    
-    signal(SIGINT, sigint_handler);
-    atexit(cleanup);
-    
-    //creating named channels
-    mkfifo(FIFO_NAME1, 0666);
-    mkfifo(FIFO_NAME2, 0666);
-    
-    pid_t pid = fork();
-    if (pid == -1) {
-        perror("fork");
-        return 1;
-    }
-    
-    srand(time(NULL) ^ (getpid() << 16));
-    
-    int fd_read, fd_write;
-    if (pid == 0) {
-        //child process(start with guesser)
-        fd_read = open(FIFO_NAME1, O_RDONLY);
-        fd_write = open(FIFO_NAME2, O_WRONLY);
-        printf("Child process started as guesser (pid: %d)\n", getpid());
-    } else {
-        //parent process
-        fd_write = open(FIFO_NAME1, O_WRONLY);
-        fd_read = open(FIFO_NAME2, O_RDONLY);
-        printf("Parent process started as thinker (pid: %d)\n", getpid());
-    }
-    
-    int cycles = 0;
-    int is_guesser = (pid == 0); // 1 - guessr, 0 - thinker
-
-    while (cycles < GAME_CYCLES && !game_over) {
-        if (!is_guesser) {
-            //mod thinker
-            int number = rand() % N + 1;
-            printf("Thinker (pid %d): I'm thinking of %d\n", getpid(), number);
-            
-            //send number for guesser
-            char buffer[BUFFER_SIZE];
-            snprintf(buffer, BUFFER_SIZE, "THINK %d", number);
-            write(fd_write, buffer, strlen(buffer)+1);
-            
-            //accept and check
-            int attempts = 0;
-            char response[BUFFER_SIZE];
-            while (!game_over) {
-                read(fd_read, response, BUFFER_SIZE);
-                
-                if (strncmp(response, "GUESS", 5) == 0) {
-                    int guess;
-                    sscanf(response, "GUESS %d", &guess);
-                    attempts++;
-                    
-                    if (guess == number) {
-                        printf("Thinker: Correct guess %d in %d attempts!\n", guess, attempts);
-                        snprintf(buffer, BUFFER_SIZE, "RESULT CORRECT %d", attempts);
-                        write(fd_write, buffer, strlen(buffer)+1);
-                        break;
-                    } else {
-                        printf("Thinker: Wrong guess %d (attempt %d)\n", guess, attempts);
-                        snprintf(buffer, BUFFER_SIZE, "RESULT WRONG");
-                        write(fd_write, buffer, strlen(buffer)+1);
-                    }
-                }
-            }
-            is_guesser = 1; //change rols
-        } else {
-            char message[BUFFER_SIZE];
-            read(fd_read, message, BUFFER_SIZE);
-            
-            if (strncmp(message, "THINK", 5) == 0) {
-                int number;
-                sscanf(message, "THINK %d", &number);
-                int attempts = 0;
-                
-                while (!game_over) {
-                    attempts++;
-                    int guess = rand() % N + 1;
-                    printf("Guesser (pid %d): Attempt %d - guessing %d\n", 
-                          getpid(), attempts, guess);
-                    
-                    //send guess
-                    char buffer[BUFFER_SIZE];
-                    snprintf(buffer, BUFFER_SIZE, "GUESS %d", guess);
-                    write(fd_write, buffer, strlen(buffer)+1);
-                    
-                    //get a response
-                    read(fd_read, message, BUFFER_SIZE);
-                    if (strncmp(message, "RESULT CORRECT", 14) == 0) {
-                        int used_attempts;
-                        sscanf(message, "RESULT CORRECT %d", &used_attempts);
-                        printf("Guesser: Correct! Number was %d (attempts: %d)\n",
-                              number, used_attempts);
-                        break;
-                    } else if (strncmp(message, "RESULT WRONG", 12) == 0) {
-                        continue;
-                    }
-                }
-                is_guesser = 0; //change rols
-            }
+    int N = MAX_N;
+    if (argc == 2) {
+        N = atoi(argv[1]);
+        if (N < 1 || N > MAX_N) {
+            fprintf(stderr, "Число должно быть от 1 до %d\n", MAX_N);
+            exit(EXIT_FAILURE);
         }
-        //retry for win
-        cycles++;
-        printf("--- Completed round %d ---\n", cycles);
     }
-    
-    //End
-    close(fd_read);
-    close(fd_write);
-    
-    if (pid != 0) {
-        int status;
-        waitpid(pid, &status, 0);
-        printf("Game finished after %d rounds\n", cycles);
+
+    srand(time(NULL));
+
+    // Создание FIFO
+    atexit(cleanup);
+    mkfifo(FIFO_REQ, 0666);
+    mkfifo(FIFO_RES, 0666);
+
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        perror("fork");
+        exit(EXIT_FAILURE);
     }
-    
+
+    if (pid == 0) {
+        // Дочерний процесс: угадывает
+        int fd_req = open(FIFO_REQ, O_WRONLY);
+        int fd_res = open(FIFO_RES, O_RDONLY);
+
+        for (int i = 0; i < ROUNDS; i++) {
+            child_round(N, fd_req, fd_res);
+            sleep(1); // Пауза для читаемости вывода (опционально)
+        }
+
+        close(fd_req);
+        close(fd_res);
+        exit(0);
+    } else {
+        // Родительский процесс: загадывает
+        int fd_req = open(FIFO_REQ, O_RDONLY);
+        int fd_res = open(FIFO_RES, O_WRONLY);
+
+        for (int i = 0; i < ROUNDS; i++) {
+            parent_round(N, fd_req, fd_res);
+        }
+
+        close(fd_req);
+        close(fd_res);
+        wait(NULL); // Ждём завершения дочернего процесса
+    }
+
     return 0;
 }

@@ -1,194 +1,170 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
-#include <sys/types.h>
+#include <string.h>
 #include <sys/wait.h>
-#include <stdbool.h>
-#include <errno.h>
 
-#define MAX_ATTEMPTS 100
-#define GAME_CYCLES 10
-#define TIMEOUT_SEC 5
+#define ROUNDS 10
+#define MAX_N 100
 
-typedef struct {
-    int number;
-    int guess;
-    int attempts;
-    bool is_correct;
-    bool waiting_for_response;
-} GameData;
+pid_t other_pid;
+int target_number = 0;
+int attempts = 0;
+int received_response = 0;
+int is_child = 0;
+int game_over = 0;
+int current_round = 0;
+int N = MAX_N;
 
-volatile sig_atomic_t game_over = 0;
-volatile GameData game;
-
-void flush_output() {
-    fflush(stdout);
+// Перемешивание массива (Фишер-Йетс)
+void shuffle(int *array, int n) {
+    for (int i = n - 1; i > 0; --i) {
+        int j = rand() % (i + 1);
+        int tmp = array[i];
+        array[i] = array[j];
+        array[j] = tmp;
+    }
 }
 
-void alarm_handler(int sig) {
-    (void)sig;
+// Обработка сигнала "угадал"
+void handle_sigusr1(int sig) {
+    printf("[Игрок %d] Угадал число за %d попыток!\n", is_child, attempts);
+    received_response = 1;
     game_over = 1;
-    printf("\nTimeout reached. Ending game.\n");
-    flush_output();
 }
 
-void thinker_handler(int sig, siginfo_t *info, void *ucontext) {
-    if (sig >= SIGRTMIN && sig <= SIGRTMAX) {
-        game.guess = info->si_value.sival_int;
-        game.attempts++;
-        
-        if (game.guess == game.number) {
-            game.is_correct = true;
-            printf("Thinker: Correct! %d in %d attempts\n", game.guess, game.attempts);
-        } else {
-            game.is_correct = false;
-            printf("Thinker: Wrong guess %d (attempt %d)\n", game.guess, game.attempts);
-        }
-        flush_output();
-        
-        //send response
+// Обработка сигнала "не угадал"
+void handle_sigusr2(int sig) {
+    received_response = 1;
+}
+
+// Обработка сигнала от другого процесса (угадывание)
+void handle_guess(int sig, siginfo_t *info, void *context) {
+    int guessed = info->si_value.sival_int;
+    attempts++;
+    printf("[Родитель] Получил попытку: %d (цель: %d)\n", guessed, target_number);
+
+    if (guessed == target_number) {
+        kill(other_pid, SIGUSR1);
+    } else {
+        kill(other_pid, SIGUSR2);
+    }
+}
+
+// Ожидание ответа от родителя
+void wait_for_response() {
+    while (!received_response) {
+        pause();
+    }
+    received_response = 0;
+}
+
+// Родитель загадывает число
+void parent_round() {
+    target_number = (rand() % N) + 1;
+    attempts = 0;
+    game_over = 0;
+
+    printf("\n[Родитель] Загадал число от 1 до %d\n", N);
+
+    while (!game_over) {
+        pause();
+    }
+}
+
+// Дочерний процесс угадывает в случайном порядке без повторений
+void child_round() {
+    int *numbers = malloc(sizeof(int) * N);
+    for (int i = 0; i < N; ++i) {
+        numbers[i] = i + 1;
+    }
+    shuffle(numbers, N);
+
+    attempts = 0;
+    game_over = 0;
+
+    for (int i = 0; i < N && !game_over; ++i) {
+        int guess = numbers[i];
+        printf("[Дочерний] Пробую: %d\n", guess);
+
+        // Используем sigqueue для отправки числа
         union sigval value;
-        value.sival_int = game.is_correct;
-        sigqueue(info->si_pid, SIGUSR1, value);
-    }
-}
+        value.sival_int = guess;
+        sigqueue(other_pid, SIGRTMIN, value);
 
-void guesser_handler(int sig, siginfo_t *info, void *ucontext) {
-    if (sig == SIGUSR1) {
-        game.is_correct = info->si_value.sival_int;
-        game.waiting_for_response = false;
-        
-        if (game.is_correct) {
-            printf("Guesser: Correct! Number was %d (attempts: %d)\n", 
-                  game.guess, game.attempts);
-        } else {
-            printf("Guesser: Wrong! Attempt %d: %d\n", game.attempts, game.guess);
-        }
-        flush_output();
+        wait_for_response();
     }
+
+    free(numbers);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <N>\n", argv[0]);
-        return 1;
+    if (argc == 2) {
+        N = atoi(argv[1]);
+        if (N < 1 || N > MAX_N) {
+            fprintf(stderr, "Число должно быть от 1 до %d\n", MAX_N);
+            exit(EXIT_FAILURE);
+        }
     }
 
-    int N = atoi(argv[1]);
-    if (N <= 0) {
-        fprintf(stderr, "N must be positive\n");
-        return 1;
-    }
+    srand(time(NULL));
 
-    //initialize game data
-    game.number = 0;
-    game.guess = 0;
-    game.attempts = 0;
-    game.is_correct = false;
-    game.waiting_for_response = false;
+    // Установка обработчиков сигналов SIGRTMIN
+    struct sigaction sa_guess = {0};
+    sa_guess.sa_sigaction = handle_guess;
+    sa_guess.sa_flags = SA_SIGINFO;
 
-    //set alarm handler
-    signal(SIGALRM, alarm_handler);
+    // Устанавливаем обработчики для всех сигналов от SIGRTMIN
+    sigaction(SIGRTMIN, &sa_guess, NULL);
+
+    signal(SIGUSR1, handle_sigusr1);
+    signal(SIGUSR2, handle_sigusr2);
 
     pid_t pid = fork();
-    if (pid == -1) {
+
+    if (pid < 0) {
         perror("fork");
-        return 1;
+        exit(EXIT_FAILURE);
     }
 
-    srand(time(NULL) ^ (getpid() << 16));
-
     if (pid == 0) {
-        //child process - guesser
-        struct sigaction sa;
-        sa.sa_flags = SA_SIGINFO;
-        sa.sa_sigaction = guesser_handler;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGUSR1, &sa, NULL);
+        is_child = 1;
+        other_pid = getppid();
+    } else {
+        is_child = 0;
+        other_pid = pid;
+    }
 
-        printf("Child process started as guesser (pid: %d)\n", getpid());
-        flush_output();
+    while (1) {
+        for (current_round = 1; current_round <= ROUNDS; ++current_round) {
+            printf("\n===== Раунд %d =====\n", current_round);
 
-        int cycles = 0;
-        while (cycles < GAME_CYCLES && !game_over) {
-            alarm(TIMEOUT_SEC);
-
-            //generate guess
-            game.guess = rand() % N + 1;
-            game.attempts++;
-            printf("Guesser: Attempt %d - guessing %d\n", game.attempts, game.guess);
-            flush_output();
-
-            //send guess to parent
-            union sigval value;
-            value.sival_int = game.guess;
-            game.waiting_for_response = true;
-            if (sigqueue(getppid(), SIGRTMIN, value) == -1) {
-                perror("sigqueue");
-                break;
+            if (is_child) {
+                child_round();
+            } else {
+                parent_round();
             }
 
-            //wait for response
-            while (game.waiting_for_response && !game_over) {
-                pause();
+            // Меняем роли
+            is_child = !is_child;
+            pid_t temp = other_pid;
+            other_pid = getpid();
+            if (is_child) {
+                other_pid = temp;
             }
-            
-            if (game.is_correct) {
-                game.attempts = 0;
-                cycles++;
-                //switch roles after correct guess
-                printf("\n--- Switching roles ---\n");
-            }
-            
-            alarm(0);
-        }
-        
-        printf("Child process exiting\n");
-        flush_output();
-    } 
-    else {
-        //parent process - thinker
-        struct sigaction sa;
-        sa.sa_flags = SA_SIGINFO;
-        sa.sa_sigaction = thinker_handler;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGRTMIN, &sa, NULL);
 
-        printf("Parent process started as thinker (pid: %d)\n", getpid());
-        flush_output();
-
-        int cycles = 0;
-        while (cycles < GAME_CYCLES && !game_over) {
-            alarm(TIMEOUT_SEC);
-
-            //generate number to guess
-            game.number = rand() % N + 1;
-            game.attempts = 0;
-            game.is_correct = false;
-            printf("Thinker: New number is %d\n", game.number);
-            flush_output();
-
-            //wait for correct guess
-            while (!game_over && !game.is_correct) {
-                pause();
-            }
-            
-            if (game.is_correct) {
-                cycles++;
-            }
-            
-            alarm(0);
+            sleep(1);  // для читаемости вывода
         }
 
-        //END
-        kill(pid, SIGTERM);
-        int status;
-        waitpid(pid, &status, 0);
-        printf("Game finished after %d rounds\n", cycles);
-        flush_output();
+        if (!is_child) {
+            kill(other_pid, SIGTERM);
+            wait(NULL);
+        }
     }
 
     return 0;
 }
+
