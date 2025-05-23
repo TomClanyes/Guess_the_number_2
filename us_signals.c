@@ -1,170 +1,138 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <signal.h>
+#include <unistd.h>
 #include <time.h>
 #include <string.h>
 #include <sys/wait.h>
 
-#define ROUNDS 10
-#define MAX_N 100
+volatile sig_atomic_t guessed = 0;
+int secret_number = 0;
+int max_number = 100;
+int round_number = 0;
+pid_t child_pid;
 
-pid_t other_pid;
-int target_number = 0;
-int attempts = 0;
-int received_response = 0;
-int is_child = 0;
-int game_over = 0;
-int current_round = 0;
-int N = MAX_N;
-
-// Перемешивание массива (Фишер-Йетс)
-void shuffle(int *array, int n) {
-    for (int i = n - 1; i > 0; --i) {
-        int j = rand() % (i + 1);
-        int tmp = array[i];
-        array[i] = array[j];
-        array[j] = tmp;
-    }
-}
-
-// Обработка сигнала "угадал"
-void handle_sigusr1(int sig) {
-    printf("[Игрок %d] Угадал число за %d попыток!\n", is_child, attempts);
-    received_response = 1;
-    game_over = 1;
-}
-
-// Обработка сигнала "не угадал"
-void handle_sigusr2(int sig) {
-    received_response = 1;
-}
-
-// Обработка сигнала от другого процесса (угадывание)
 void handle_guess(int sig, siginfo_t *info, void *context) {
-    int guessed = info->si_value.sival_int;
-    attempts++;
-    printf("[Родитель] Получил попытку: %d (цель: %d)\n", guessed, target_number);
-
-    if (guessed == target_number) {
-        kill(other_pid, SIGUSR1);
+    int guess = info->si_value.sival_int;
+    if (guess == secret_number) {
+        kill(info->si_pid, SIGUSR1); // Угадал
+        guessed = 1;
     } else {
-        kill(other_pid, SIGUSR2);
+        kill(info->si_pid, SIGUSR2); // Не угадал
     }
 }
 
-// Ожидание ответа от родителя
-void wait_for_response() {
-    while (!received_response) {
-        pause();
-    }
-    received_response = 0;
+void setup_guess_handler() {
+    struct sigaction sa;
+    sa.sa_sigaction = handle_guess;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGRTMIN, &sa, NULL);
 }
 
-// Родитель загадывает число
-void parent_round() {
-    target_number = (rand() % N) + 1;
-    attempts = 0;
-    game_over = 0;
+void play_parent(int rounds, int max) {
+    srand(time(NULL) ^ getpid());
+    setup_guess_handler();
 
-    printf("\n[Родитель] Загадал число от 1 до %d\n", N);
+    for (int i = 1; i <= rounds; i++) {
+        round_number = i;
+        secret_number = 1 + rand() % max;
+        guessed = 0;
 
-    while (!game_over) {
-        pause();
+        printf("[Родитель] Загадал число для раунда %d\n", i);
+        kill(child_pid, SIGUSR1); // Старт раунда
+
+        while (!guessed) {
+            pause();
+        }
+
+        // Ждём подтверждение от ребёнка
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGUSR2);
+        siginfo_t si;
+        sigwaitinfo(&mask, &si);
     }
+
+    printf("[Родитель] Игра завершена.\n");
+    kill(child_pid, SIGTERM);
+    wait(NULL);
 }
 
-// Дочерний процесс угадывает в случайном порядке без повторений
-void child_round() {
-    int *numbers = malloc(sizeof(int) * N);
-    for (int i = 0; i < N; ++i) {
+void child_round(int max, sigset_t mask) {
+    int *numbers = malloc(sizeof(int) * max);
+    for (int i = 0; i < max; i++) {
         numbers[i] = i + 1;
     }
-    shuffle(numbers, N);
 
-    attempts = 0;
-    game_over = 0;
+    int size = max;
+    int attempts = 0;
 
-    for (int i = 0; i < N && !game_over; ++i) {
-        int guess = numbers[i];
+    while (size > 0) {
+        int index = rand() % size;
+        int guess = numbers[index];
+        attempts++;
+
         printf("[Дочерний] Пробую: %d\n", guess);
 
-        // Используем sigqueue для отправки числа
-        union sigval value;
-        value.sival_int = guess;
-        sigqueue(other_pid, SIGRTMIN, value);
+        union sigval val;
+        val.sival_int = guess;
+        sigqueue(getppid(), SIGRTMIN, val);
 
-        wait_for_response();
+        siginfo_t si;
+        sigwaitinfo(&mask, &si);
+        if (si.si_signo == SIGUSR1) {
+            printf("[Дочерний] Угадал число %d за %d попыток\n", guess, attempts);
+            kill(getppid(), SIGUSR2); // Подтверждение
+            break;
+        } else {
+            numbers[index] = numbers[size - 1];
+            size--;
+        }
     }
 
     free(numbers);
 }
 
+void play_child(int max) {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    sigaddset(&mask, SIGUSR2);
+
+    srand(time(NULL) ^ getpid());
+
+    while (1) {
+        siginfo_t si;
+        sigwaitinfo(&mask, &si); // Ожидаем SIGUSR1 (старт раунда)
+        child_round(max, mask);
+    }
+}
+
 int main(int argc, char *argv[]) {
-    if (argc == 2) {
-        N = atoi(argv[1]);
-        if (N < 1 || N > MAX_N) {
-            fprintf(stderr, "Число должно быть от 1 до %d\n", MAX_N);
-            exit(EXIT_FAILURE);
-        }
+    if (argc != 2 || (max_number = atoi(argv[1])) <= 0) {
+        fprintf(stderr, "Usage: %s <max_number>\n", argv[0]);
+        return 1;
     }
 
-    srand(time(NULL));
-
-    // Установка обработчиков сигналов SIGRTMIN
-    struct sigaction sa_guess = {0};
-    sa_guess.sa_sigaction = handle_guess;
-    sa_guess.sa_flags = SA_SIGINFO;
-
-    // Устанавливаем обработчики для всех сигналов от SIGRTMIN
-    sigaction(SIGRTMIN, &sa_guess, NULL);
-
-    signal(SIGUSR1, handle_sigusr1);
-    signal(SIGUSR2, handle_sigusr2);
+    sigset_t block_all;
+    sigemptyset(&block_all);
+    sigaddset(&block_all, SIGUSR1);
+    sigaddset(&block_all, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &block_all, NULL);
 
     pid_t pid = fork();
 
     if (pid < 0) {
         perror("fork");
-        exit(EXIT_FAILURE);
-    }
-
-    if (pid == 0) {
-        is_child = 1;
-        other_pid = getppid();
+        return 1;
+    } else if (pid == 0) {
+        play_child(max_number);
     } else {
-        is_child = 0;
-        other_pid = pid;
-    }
-
-    while (1) {
-        for (current_round = 1; current_round <= ROUNDS; ++current_round) {
-            printf("\n===== Раунд %d =====\n", current_round);
-
-            if (is_child) {
-                child_round();
-            } else {
-                parent_round();
-            }
-
-            // Меняем роли
-            is_child = !is_child;
-            pid_t temp = other_pid;
-            other_pid = getpid();
-            if (is_child) {
-                other_pid = temp;
-            }
-
-            sleep(1);  // для читаемости вывода
-        }
-
-        if (!is_child) {
-            kill(other_pid, SIGTERM);
-            wait(NULL);
-        }
+        child_pid = pid;
+        play_parent(10, max_number);
     }
 
     return 0;
 }
-
